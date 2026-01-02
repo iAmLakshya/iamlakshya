@@ -1,4 +1,5 @@
 import { cn } from "@/lib/cn";
+import { EmailLink } from "@/components/email-link";
 import { ExperienceList } from "@/components/experience";
 import { List } from "@/components/list";
 import { Section } from "@/components/section";
@@ -54,10 +55,7 @@ export default function Home() {
               href={socialLinks.linkedin}
               icon={<LinkedinIcon className="size-5" />}
             />
-            <SocialLink
-              href={socialLinks.email}
-              icon={<MailIcon className="size-5" />}
-            />
+            <EmailLink icon={<MailIcon className="size-5" />} />
             <SocialLink
               href={socialLinks.instagram}
               icon={<InstagramIcon className="size-5" />}
