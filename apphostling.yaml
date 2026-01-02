@@ -1,4 +1,3 @@
-# Settings for Cloud Run
 runConfig:
   minInstances: 0
   maxInstances: 100
@@ -6,7 +5,6 @@ runConfig:
   cpu: 1
   memoryMiB: 512
 
-# Environment variables and secrets
 env:
   - variable: ENVIRONMENT
     value: production
@@ -14,22 +12,22 @@ env:
       - BUILD
       - RUNTIME
   - variable: NEXT_PUBLIC_POSTHOG_KEY
-    secret: NEXT_PUBLIC_POSTHOG_KEY
+    value: phc_WjhcyKphsY4L3MPce3GMxto5VmewI4LWGkjjOFfCxXa
     availability:
       - BUILD
       - RUNTIME
   - variable: NEXT_PUBLIC_POSTHOG_HOST
-    secret: NEXT_PUBLIC_POSTHOG_HOST
+    value: https://eu.i.posthog.com
     availability:
       - BUILD
       - RUNTIME
   - variable: NEXT_PUBLIC_SUPABASE_URL
-    secret: NEXT_PUBLIC_SUPABASE_URL
+    value: https://fjfnnuxexoyxfjucdxva.supabase.co
     availability:
       - BUILD
       - RUNTIME
   - variable: NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY
-    secret: NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY
+    value: sb_publishable_vBi6Vi7ukjplGxzrT7Nr_w_bzv543-3
     availability:
       - BUILD
       - RUNTIME
