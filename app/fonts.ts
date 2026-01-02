@@ -1,8 +1,15 @@
-import { PT_Serif } from 'next/font/google';
+import { Coming_Soon, Open_Sans } from "next/font/google";
 
-export const ptSerif = PT_Serif({
-  subsets: ['latin'],
-  weight: ['400', '700'],
-  style: ['normal', 'italic'],
-  display: 'swap',
+export const HeadingText = Coming_Soon({
+  subsets: ["latin"],
+  weight: ["400"],
+  style: ["normal"],
+  display: "swap",
+});
+
+export const MainText = Open_Sans({
+  subsets: ["latin"],
+  weight: ["300"],
+  style: ["normal", "italic"],
+  display: "swap",
 });

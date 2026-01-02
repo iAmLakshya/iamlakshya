@@ -1,2 +1,31 @@
 @import "tailwindcss";
 
+*,
+*::before,
+*::after,
+html,
+body,
+a,
+button,
+input,
+textarea,
+select,
+[role="button"] {
+  cursor: none !important;
+}
+
+@media (pointer: coarse), (hover: none) {
+  *,
+  *::before,
+  *::after,
+  html,
+  body,
+  a,
+  button,
+  input,
+  textarea,
+  select,
+  [role="button"] {
+    cursor: auto !important;
+  }
+}
