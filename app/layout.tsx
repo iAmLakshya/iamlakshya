@@ -7,7 +7,8 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Lakshya Singh Panwar",
-  description: "Full Stack Developer",
+  description:
+    "Full stack developer who breaks things to understand them, then sometimes fixes them. Currently in London with too many browser tabs open.",
   icons: {
     icon: [
       { url: "/favicon-16x16.png", sizes: "16x16", type: "image/png" },
