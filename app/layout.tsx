@@ -1,7 +1,9 @@
-import type { Metadata } from "next";
-import "./globals.css";
-import { MainText } from "./fonts";
 import { CursorProvider } from "@/components/cursor-provider";
+import { LiveCursors } from "@/components/live-cursors";
+import { LiveCursorsProvider } from "@/components/live-cursors-provider";
+import type { Metadata } from "next";
+import { MainText } from "./fonts";
+import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Lakshya Singh Panwar",
@@ -24,7 +26,10 @@ export default function RootLayout({
   return (
     <html lang="en" className={MainText.className}>
       <body>
-        <CursorProvider>{children}</CursorProvider>
+        <LiveCursorsProvider>
+          <CursorProvider>{children}</CursorProvider>
+          <LiveCursors />
+        </LiveCursorsProvider>
       </body>
     </html>
   );
