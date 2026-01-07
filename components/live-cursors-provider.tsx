@@ -1,6 +1,15 @@
 "use client";
 
 import {
+  calculateFabricatedCount,
+  createFabricatedUser,
+  FABRICATED_CONFIG,
+  fabricatedUserToCursor,
+  isFabricatedUserExpired,
+  updateFabricatedPosition,
+  type FabricatedUser,
+} from "@/lib/fabricated-cursors";
+import {
   CURSOR_CHANNEL,
   CURSOR_TIMEOUT_MS,
   THROTTLE_MS,
@@ -75,14 +84,16 @@ export function LiveCursorsProvider({ children }: LiveCursorsProviderProps) {
   const pathname = usePathname();
 
   const [remoteCursors, setRemoteCursors] = useState<RemoteCursor[]>([]);
-  const [onlineCount, setOnlineCount] = useState(1);
+  const [realOnlineCount, setRealOnlineCount] = useState(1);
   const [isConnected, setIsConnected] = useState(false);
   const [isTouch, setIsTouch] = useState(true);
+  const [fabricatedUsers, setFabricatedUsers] = useState<FabricatedUser[]>([]);
 
   const channelRef = useRef<RealtimeChannel | null>(null);
   const userIdRef = useRef("");
   const colorRef = useRef("");
   const lastBroadcastRef = useRef(0);
+  const nextSpawnTimeRef = useRef(0);
 
   useEffect(() => {
     userIdRef.current = getUserId();
@@ -107,7 +118,7 @@ export function LiveCursorsProvider({ children }: LiveCursorsProviderProps) {
 
   const handlePresenceSync = useCallback((channel: RealtimeChannel) => {
     const state = channel.presenceState();
-    setOnlineCount(Object.keys(state).length);
+    setRealOnlineCount(Object.keys(state).length);
   }, []);
 
   const handleCursorMove = useCallback(
@@ -203,14 +214,110 @@ export function LiveCursorsProvider({ children }: LiveCursorsProviderProps) {
     };
   }, [isTouch, pathname]);
 
+  // Fabricated cursor lifecycle management
+  useEffect(() => {
+    if (isTouch) return;
+
+    const manageLifecycle = () => {
+      const now = Date.now();
+
+      setFabricatedUsers((prev) => {
+        const currentActiveCount = prev.filter((u) => !u.isLeaving).length;
+        const neededCount = calculateFabricatedCount(
+          realOnlineCount,
+          currentActiveCount
+        );
+
+        // Mark expired users as leaving and filter out old ones
+        let updated = prev
+          .map((user) => {
+            if (isFabricatedUserExpired(user) && !user.isLeaving) {
+              return { ...user, isLeaving: true, ttl: user.ttl + 2000 }; // Extra 2s for exit animation
+            }
+            return user;
+          })
+          .filter(
+            (user) => !user.isLeaving || Date.now() - user.createdAt < user.ttl
+          );
+
+        // Update pathnames for existing users
+        updated = updated.map((user) => ({
+          ...user,
+          pathname,
+        }));
+
+        // Spawn new users if needed (with random delay)
+        const activeCount = updated.filter((u) => !u.isLeaving).length;
+        if (activeCount < neededCount && now >= nextSpawnTimeRef.current) {
+          const newUser = createFabricatedUser(pathname);
+          updated = [...updated, newUser];
+
+          // Set random delay before next spawn
+          nextSpawnTimeRef.current =
+            now +
+            Math.random() *
+              (FABRICATED_CONFIG.respawnDelay.max -
+                FABRICATED_CONFIG.respawnDelay.min) +
+            FABRICATED_CONFIG.respawnDelay.min;
+        }
+
+        return updated;
+      });
+    };
+
+    // Run lifecycle check every second
+    const lifecycleInterval = setInterval(manageLifecycle, 1000);
+
+    // Initial spawn
+    manageLifecycle();
+
+    return () => clearInterval(lifecycleInterval);
+  }, [isTouch, realOnlineCount, pathname]);
+
+  // Fabricated cursor movement animation
+  useEffect(() => {
+    if (isTouch || fabricatedUsers.length === 0) return;
+
+    const moveInterval = setInterval(() => {
+      setFabricatedUsers((prev) =>
+        prev.map((user) => {
+          if (user.isLeaving) return user;
+          return updateFabricatedPosition(user);
+        })
+      );
+    }, FABRICATED_CONFIG.movementInterval);
+
+    return () => clearInterval(moveInterval);
+  }, [isTouch, fabricatedUsers.length]);
+
+  // Combine real cursors with fabricated ones
   const filteredCursors = useMemo(
     () => remoteCursors.filter((c) => c.pathname === pathname),
     [remoteCursors, pathname]
   );
 
+  const fabricatedCursors = useMemo(
+    () =>
+      fabricatedUsers
+        .filter((u) => u.pathname === pathname)
+        .map(fabricatedUserToCursor),
+    [fabricatedUsers, pathname]
+  );
+
+  const allCursors = useMemo(
+    () => [...filteredCursors, ...fabricatedCursors],
+    [filteredCursors, fabricatedCursors]
+  );
+
+  // Combined online count: real users + active fabricated users
+  const onlineCount = useMemo(() => {
+    const activeFabricated = fabricatedUsers.filter((u) => !u.isLeaving).length;
+    return realOnlineCount + activeFabricated;
+  }, [realOnlineCount, fabricatedUsers]);
+
   const value = useMemo(
-    () => ({ remoteCursors: filteredCursors, onlineCount, isConnected }),
-    [filteredCursors, onlineCount, isConnected]
+    () => ({ remoteCursors: allCursors, onlineCount, isConnected }),
+    [allCursors, onlineCount, isConnected]
   );
 
   return (
