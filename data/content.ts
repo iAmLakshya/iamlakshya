@@ -20,13 +20,19 @@ export interface WriteupItem {
 
 export const experience: ExperienceItem[] = [
   {
+    organization: "Sammy Labs",
+    location: "London, UK",
+    period: "Jan 2026 - Present",
+    description: "Doing everything AI Engineering",
+  },
+   {
     organization: "Kundra",
     location: "Paris, FR",
-    period: "2025 - Present",
-    description: "Building AI-native HR tools as a founding engineer",
+    period: "2025",
+    description: "AI-native HR tools as a founding engineer",
   },
   {
-    organization: "Emote Care",
+    organization: "emote Care",
     location: "London, UK",
     period: "2024 - 2025",
     description: "Led a team of 7 through a full platform rebuild",
