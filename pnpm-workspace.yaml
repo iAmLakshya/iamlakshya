@@ -1,3 +1,10 @@
+# pnpm 11+ (used by Firebase App Hosting) reads allowBuilds.
+# sharp: needed for Next.js image optimization. core-js: postinstall is only a funding notice.
+allowBuilds:
+  sharp: true
+  core-js: false
+
+# Legacy equivalents, kept for pnpm 10 (local dev).
 onlyBuiltDependencies:
   - sharp
 
