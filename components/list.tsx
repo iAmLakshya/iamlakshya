@@ -2,6 +2,7 @@
 
 import { ReactNode } from "react";
 import posthog from "posthog-js";
+import Link from "next/link";
 import { GithubIcon, ExternalLinkIcon, ArticleIcon } from "@/components/icons";
 
 type ListItemType = "project" | "writeup";
@@ -12,6 +13,8 @@ interface ListItemProps {
   href?: string;
   type?: ListItemType;
   icon?: ReactNode;
+  /** Route on this site: navigate in place rather than opening a tab. */
+  internal?: boolean;
 }
 
 interface ListProps {
@@ -39,6 +42,7 @@ export function ListItem({
   href,
   type,
   icon,
+  internal,
 }: ListItemProps) {
   const handleClick = () => {
     if (href) {
@@ -64,17 +68,26 @@ export function ListItem({
           </p>
         )}
       </div>
-      {href && (
-        <a
-          href={href}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={handleClick}
-          className="flex-shrink-0 text-gray-400 p-1 -m-1"
-        >
-          {icon || getIconForLink(href, type)}
-        </a>
-      )}
+      {href &&
+        (internal ? (
+          <Link
+            href={href}
+            onClick={handleClick}
+            className="flex-shrink-0 p-1 -m-1 text-gray-400"
+          >
+            {icon || <ArticleIcon className="size-4" />}
+          </Link>
+        ) : (
+          <a
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={handleClick}
+            className="flex-shrink-0 p-1 -m-1 text-gray-400"
+          >
+            {icon || getIconForLink(href, type)}
+          </a>
+        ))}
     </div>
   );
 }

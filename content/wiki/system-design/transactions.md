@@ -1,0 +1,279 @@
+---
+title: "Transactions and Isolation"
+description: "ACID, the isolation levels from read committed to serialisable, and the three routes to serialisability"
+section: "system-design"
+order: 3
+tags: ["transactions", "isolation", "concurrency", "2pl", "ssi"]
+source:
+  notes: ["notes/digital/pages/page-03.md", "notes/digital/pages/page-04.md", "notes/digital/pages/page-05.md"]
+---
+
+# Transactions and Isolation
+
+A transaction is a group of reads and writes that the database agrees to treat as one unit. They all
+happen or none of them does, and while they are happening the rest of the world is kept from seeing
+the half-finished state. ACID is the acronym for the guarantees that come with that agreement.
+
+## ==ACID transactions==
+
+**Atomicity** is the all-or-nothing rule. Either all the writes in the transaction save or none of
+them do, and nothing outside the transaction ever observes a state in which half of them landed.
+**Consistency** means a committed transaction leaves the database in a legal state. **Isolation**
+means concurrent transactions do not race with one another, and each behaves as though it had the
+database to itself. **Durability** means committed writes are not lost: once the commit call
+returns, the write survives whatever happens to the machine next.
+
+Consistency is the one most often misread, usually as something along the lines of "failures are
+handled gracefully". That is Atomicity's job, not Consistency's. In the paper that coined the
+acronym, Consistency is a claim about the legality of what gets committed, "each successful
+transaction by definition commits only legal results", meaning the constraints still hold once the
+transaction is done, along with the cascades and the triggers that enforce them.[^1]
+
+## ==Read committed isolation==
+
+Databases are multithreaded, and the transactions running on those threads overlap in time. Read
+committed is the level that rules out the two crudest ways that overlap goes wrong: dirty writes and
+dirty reads.
+
+A **dirty write** is one transaction writing over a value that another transaction has written and
+not yet committed. The trouble it causes surfaces later, when the first transaction rolls back and
+the engine has to decide what to put back in the row. Restoring the pre-transaction value undoes a
+write the second transaction made deliberately; leaving the row alone keeps a value nobody ever
+committed. Neither answer is correct, and there is no third one available. The fix is a row-level
+lock, taken the moment a transaction first writes a row and held until it commits or aborts, which
+keeps any second writer out of that row for the whole interval.
+
+A **dirty read** is one transaction reading a value that another transaction has written and not yet
+committed. Nothing on disk is corrupted here, which is why a weaker fix will do. The problem is only
+that the reader gets back an answer that may never become true, because the writer is still free to
+roll back. A row-level lock would work, but it is expensive out of all proportion to the harm, since
+every reader would then have to queue behind every writer. Keeping the old value around until the
+write commits does the job far better. Readers go on seeing the last committed value while the
+writer is still working, and neither side waits for the other.
+
+What read committed still allows is for one transaction to read the same row twice and get two
+different answers, because each of those reads sees whatever happened to be committed at the instant
+it ran. Nothing in the level ties the two reads together.
+
+## ==Snapshot isolation==
+
+The anomaly snapshot isolation prevents is read skew. A transaction reading two rows at two
+different moments can catch the database in the middle of a transfer, seeing the first account
+before the money left it and the second account after the money arrived. The total it computes was
+never true of the database at any instant. Nothing is wrong with the data on disk while this
+happens, and nothing has been corrupted. The reader has assembled one answer out of two different
+points in time.
+
+Snapshot isolation is often equated with repeatable read. That equation holds as a fact about how
+vendors label things, but not as a formal equivalence. PostgreSQL does implement its REPEATABLE READ
+level "using a technique known in academic database literature and in some other database products
+as Snapshot Isolation". Formally, though, the two levels are *incomparable*, since neither is
+stronger than the other: snapshot isolation forbids phantoms and allows write skew, while ANSI
+repeatable read does the reverse.
+
+| Anomaly | Read committed | Snapshot isolation | Serialisable |
+|---|:--:|:--:|:--:|
+| **Dirty write** - overwriting an uncommitted value | prevented | prevented | prevented |
+| **Dirty read** - reading an uncommitted value | prevented | prevented | prevented |
+| **Read skew** - two rows read at two different moments | allowed | prevented | prevented |
+| **Write skew** - two transactions read the same rows, then write different ones | allowed | allowed | prevented |
+| **Phantom** - a row appearing that matches a condition already checked | allowed | prevented | prevented |
+
+Read the ANSI names with care. Repeatable read and snapshot isolation are often treated as the
+same level and are not: the row for write skew and the row for phantoms swap between them.[^2]
+
+The implementation stores every value alongside the WAL transaction number that wrote it, and old
+values are not deleted when they are superseded. A read returns the last value that was valid at the
+reading transaction's own number. Values written after that number are simply not considered,
+whatever else has committed in the meantime. The effect is a snapshot of the whole database, a
+consistent state as of time `T`, held still for as long as the transaction runs. The consequence is
+that versions pile up, and the engine has to work out later which of them no live transaction can
+still reach, and collect those.
+
+## ==Write skew and phantom writes==
+
+Two transactions can read the same set of rows, each satisfy itself from those reads that its own
+write is safe, and then each write a different row. Neither has overwritten the other, so by the
+usual test nothing here looks like a conflict at all. The pair still leaves the database in a state
+that neither transaction would have permitted on its own. Snapshot isolation does not catch it,
+because each transaction's reads were perfectly valid at its own transaction number and neither of
+them touched anything the other had written. The remedy is to take locks on all the rows that were
+read, and not only on the rows that will be written. Once the read is locked too, the read that
+justified the decision is itself something the other transaction has to wait for, and the two are
+forced into an order.
+
+<!-- FIGURE: WriteSkew -->
+
+A phantom occurs when two transactions write new rows that conflict with the conditions the other
+one checked. Locking what was read is no help here, because at the time of the read the rows in
+question did not exist and there was nothing to lock. The fix is to materialise the conflict: create
+a dummy row that stands for it, and force every transaction involved to update that row, which gives
+the locks something concrete to attach to. The technique is due to Fekete et al., 2005.[^3]
+
+## Three routes to serialisability
+
+Serialisability means the outcome is equivalent to running the transactions one at a time in some
+order, though not necessarily the order they arrived in. Three implementations get there, and what
+separates them is when they make somebody wait.
+
+### ==Serial execution (VoltDB)==
+
+Everything runs on one core, one transaction at a time, which removes the concurrency that would
+otherwise need controlling. It only works if transactions are short, because everything arriving
+while one transaction runs is queued behind it, and what stretches a transaction out is I/O. Disk is
+the first source of that, and the answer is to keep the working set in memory. The network is the
+second. A client sending its statements one at a time leaves the core idle between them, waiting on
+a round trip that has nothing to do with the database. **Stored procedures** are the answer to that
+one. The whole transaction arrives as a single call and runs through to completion without the core
+ever waiting on a client, and there is less data on the wire besides. The catch is operational
+rather than technical, in that stored procedures are hard to manage across wide deployments.
+
+### ==Two-phase locking==
+
+<!-- FIGURE: TwoPhaseLocking -->
+
+Two-phase locking makes concurrent transactions behave as though they had run on one thread, without
+actually confining them to one. Locks are acquired as a transaction proceeds and released only once
+it has ended, and those two stretches, the growing one and the shrinking one, are the two phases the
+name refers to.
+
+There are two kinds of lock: a shared one for readers and an exclusive one for writers. The pattern
+being protected is a read followed by a modification, where the predicate that justified the read
+has to still be true at the point of the update. Holding every lock until the end of the transaction
+is exactly what guarantees that. Any number of readers can hold the shared lock at once. A writer
+needs the exclusive lock and therefore has to wait for all of those readers to drain first, and that
+wait shows up in the tail of the latency distribution rather than in the average.
+
+The protocol is slow in practice, and deadlock is most of the reason. Deadlocks have to be detected
+and one side aborted, after which that transaction runs again from the beginning. They follow
+directly from the discipline of holding on. A transaction that already holds one lock and now needs
+a second cannot let go of the first in order to make progress, because releasing early is precisely
+what would break the guarantee the protocol exists to provide. Two transactions touching the same
+two rows in opposite orders therefore end up each holding what the other is waiting for, and nothing
+inside the protocol can break the tie. The database detects the cycle, aborts one side and lets it
+start again. The aborted side restarts from nothing, its reads and its writes both discarded, along
+with all the disk I/O that produced them. Under contention it then goes back to queueing behind the
+same locks it collided with the first time.
+
+**Predicate locks** lock every row matching a condition. What makes one different from an ordinary
+lock is that it names a condition rather than an address, which is how it manages to cover rows that
+do not exist yet, and that in turn is what makes it strong enough to stop phantoms. The expense is
+in the machinery around it. Acquiring one means running the condition against the table, and after
+that every incoming write has to be tested against the same condition to work out whether it
+collides. Taking a lock therefore costs about what evaluating a query costs, and the checking gets
+more expensive the more locks are outstanding.
+
+Index range locking is the cheap approximation to that. It works off the table index, which already
+groups keys by value, so a lock taken over a range of the index covers everything the predicate
+would have matched. It covers a good deal that the predicate would not have matched as well, which
+is rather the point: it is quicker to take because it is less precise. The price of the imprecision,
+however, is that it blocks transactions that would never have conflicted with anything.
+
+### ==Serializable snapshot isolation==
+
+The alternative to taking locks is to run as normal and correct the mistakes after they happen. SSI
+detects potential anomalies at runtime and aborts transactions as necessary. It was introduced by
+Cahill, Röhm and Fekete in 2008, and PostgreSQL has implemented its serialisable level this way
+since 9.1, released September 2011.[^4] It sits on top of snapshot isolation, so a read still takes
+its snapshot and nobody waits at the point of the read. Everything added on top is bookkeeping. It
+tracks the read-write dependencies between transactions that are currently live, and it fires when
+those dependencies arrange themselves into a shape that could not correspond to any serial order.
+
+SSI is optimistic in style, though it is not classic optimistic concurrency control, and the
+difference is where its advantage comes from: "both S2PL and classic OCC prevent concurrent
+transactions from having rw-conflicts. SSI allows some rw-conflicts as long as they do not form a
+dangerous structure, a less restrictive requirement."[^4]
+
+What separates optimistic from pessimistic control is a bet about how often transactions really do
+conflict. An optimistic scheme makes nobody wait. It lets every transaction run to completion and
+charges it only once it has proved to be wrong. If conflicts are rare, the occasional abort is
+cheaper than all the locking that would have been needed to prevent it. If conflicts are common, the
+bet loses badly. Every abort throws away work that was already finished, and the retry then contends
+with the same transactions that caused the abort in the first place, so the aborts feed each other.
+The reason SSI tends to win on a real workload is that it aborts only transactions whose reads and
+writes actually collide, whereas 2PL makes a transaction wait whenever another one happens to be
+holding a lock it wants, even in cases where the two would have produced a perfectly correct result
+running side by side. A workload of many transactions overlapping in time but rarely touching the
+same rows is where that difference is largest.
+
+PostgreSQL sizes its predicate lock table from `max_pred_locks_per_transaction`, whose default is
+64, and the documentation is candid about where that number comes from, saying it "has historically
+proven sufficient, but you might need to raise this value if you have clients that touch many
+different tables in a single serializable transaction". When the table starts running short of
+memory the engine does not fail outright. It coarsens instead, combining "multiple finer-grained
+locks (e.g., tuple locks) into fewer coarser-grained locks (e.g., page locks) during the course of
+the transaction to prevent exhaustion of the memory used to track the locks". Coarser locks catch
+rows they had no business catching, and the documentation says as much: promoting page-level locks
+to a single relation-level one brings "an increase in the rate of serialization failures".
+`max_pred_locks_per_relation` at -2 and `max_pred_locks_per_page` at 2 are the settings governing
+when that promotion happens.[^6]
+
+The practical cost of running serialisable in PostgreSQL, then, is a false-abort rate that climbs as
+the lock table coarsens. Where a given workload sits on that curve depends on how many tables a
+single serialisable transaction touches and on how much shared memory the lock table has been given,
+and the two interact — a transaction touching many tables exhausts a small table sooner, and a
+coarsened table then aborts transactions a roomier one would have let through. None of that is
+visible from the configuration. It shows up as a count of serialisation failures once the workload
+is running.
+
+Among distributed databases, CockroachDB runs serialisable by default: "By default, CockroachDB
+executes all transactions at the strongest ANSI transaction isolation level: SERIALIZABLE, which
+permits no concurrency anomalies."[^5] It reaches that level by a different route from PostgreSQL,
+using a timestamp cache and read refreshing rather than the dangerous-structure detection of Cahill
+et al., which makes it serialisable without being SSI in the strict sense.
+
+[^1]: **Principles of Transaction-Oriented Database Recovery**, Theo Haerder and Andreas Reuter,
+      ACM Computing Surveys 15(4), December 1983 - the paper that coined ACID. Its Consistency
+      clause: "A transaction reaching its normal end (EOT, end of transaction), thereby committing
+      its results, preserves the consistency of the database. In other words, each successful
+      transaction by definition commits only legal results." Its Atomicity clause is the
+      all-or-nothing one, which is where "failures are handled gracefully" actually belongs.
+      [cs-people.bu.edu](https://cs-people.bu.edu/mathan/reading-groups/papers-classics/recovery.pdf)
+
+[^2]: **A Critique of ANSI SQL Isolation Levels**, Berenson, Bernstein, Gray, Melton, O'Neil and
+      O'Neil, ACM SIGMOD 1995 - Remark 9 states the relationship as `REPEATABLE READ »« Snapshot
+      Isolation`, meaning the two are incomparable rather than equal. Snapshot isolation forbids
+      the phantom anomaly A3 but allows write skew A5B; ANSI repeatable read does the reverse. The
+      vendor-labelling half is from the **PostgreSQL 18 documentation, 13.2 Transaction
+      Isolation**, which notes that "Some other systems may even offer Repeatable Read and
+      Snapshot Isolation as distinct isolation levels with different behavior."
+      [arxiv.org](https://arxiv.org/pdf/cs/0701157),
+      [postgresql.org](https://www.postgresql.org/docs/current/transaction-iso.html)
+
+[^3]: **Serializable Snapshot Isolation in PostgreSQL**, Dan R. K. Ports and Kevin Grittner,
+      PVLDB 5(12), 2012 - "alternatively, the conflict can be materialized by creating a dummy row
+      to represent the conflict, and forcing every transaction involved to update that row". The
+      technique originates with Fekete, Liarokapis, O'Neil, O'Neil and Shasha, "Making Snapshot
+      Isolation Serializable", ACM TODS 30(2), 2005, cited there as reference [10]. That original
+      paper could not be fetched directly, so the technique is quoted from the implementers' paper
+      that cites it.
+      [drkp.net](https://drkp.net/papers/ssi-vldb12.pdf)
+
+[^4]: **Serializable Snapshot Isolation in PostgreSQL**, Ports and Grittner, PVLDB 5(12), 2012,
+      and **PostgreSQL's README-SSI** - source for the attribution ("Cahill et al. introduced SSI,
+      a technique for providing serializability using snapshot isolation, by detecting potential
+      anomalies at runtime, and aborting transactions as necessary") and for the distinction from
+      classic OCC. PostgreSQL's source tree confirms the version: "As of 9.1, serializable
+      transactions in PostgreSQL are implemented using Serializable Snapshot Isolation (SSI),
+      based on the work of Cahill et al." The original is Cahill, Röhm and Fekete, "Serializable
+      isolation for snapshot databases", SIGMOD 2008.
+      [drkp.net](https://drkp.net/papers/ssi-vldb12.pdf),
+      [github.com/postgres/postgres](https://raw.githubusercontent.com/postgres/postgres/master/src/backend/storage/lmgr/README-SSI)
+
+[^5]: **Transactions**, the CockroachDB documentation - source for the correction. Verified
+      independently of the research pass by re-fetching the page.
+      [docs.cockroachlabs.com](https://docs.cockroachlabs.com/docs/stable/transactions)
+
+[^6]: **PostgreSQL documentation** - the transaction isolation chapter and the lock management
+      configuration reference. They supply the default of 64 predicate lock objects per
+      transaction, along with `max_pred_locks_per_relation` at -2 and `max_pred_locks_per_page` at
+      2, and the degradation mode: when the predicate lock table runs short of memory, finer locks
+      are promoted to coarser ones and the rate of serialisation failures rises.
+      [postgresql.org](https://www.postgresql.org/docs/current/transaction-iso.html)
+
+<!-- FIGURE: OptimisticPessimistic -->
+
+## Related
+
+- [[Storage and Retrieval]] - the WAL and MVCC storage these levels depend on.
+- [[Database Comparisons]] - MySQL and PostgreSQL take different routes here.

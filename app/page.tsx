@@ -88,13 +88,26 @@ export default function Home() {
           <List items={projects} />
         </Section>
 
-        {/* <Section title="Latest Writeups" highlightColor="green">
+        <Section title="✍️ Writing" highlightColor="green">
           <List
-            items={writeups}
-            viewAllHref={socialLinks.blog}
-            viewAllText="View all writeups"
+            items={[
+              {
+                title: "Notes",
+                description:
+                  "Whatever I am learning at the time, written up properly enough to come back to.",
+                href: "/notes",
+                type: "writeup",
+                internal: true,
+              },
+              {
+                title: "Blog",
+                description: "Longer pieces, and random rants at the open world.",
+                href: socialLinks.blog,
+                type: "writeup",
+              },
+            ]}
           />
-        </Section> */}
+        </Section>
 
         <footer className="flex flex-col items-center justify-between gap-2 text-center font-sans text-xs text-gray-400 sm:flex-row sm:gap-0">
           <p>&copy; 2026 - Lakshya Singh Panwar</p>

@@ -1,0 +1,423 @@
+---
+title: "Search and Specialised Stores"
+description: "Inverted indexes, Lucene and Elasticsearch, time-series databases, graph databases and geospatial indexes"
+section: "system-design"
+order: 10
+tags: ["search", "elasticsearch", "lucene", "time-series", "graph-databases", "geohash"]
+source:
+  notes: ["notes/digital/pages/page-38.md", "notes/digital/pages/page-39.md", "notes/digital/pages/page-40.md", "notes/digital/pages/page-41.md", "notes/digital/pages/page-42.md", "notes/digital/pages/page-43.md"]
+---
+
+# Search and Specialised Stores
+
+## ==Search indexes==
+
+Tokenise, then build an inverted index, or several.
+
+The index is a map from a term to the list of documents that contain it, called inverted because
+the natural direction, document to its words, has been turned round. Without one, answering "which
+documents mention `apple`" means opening every document and looking, which prices a single query
+at the size of the whole corpus. With one, the term is looked up and the list of documents sitting
+under it is the answer. Combining terms then becomes set arithmetic over those lists: intersect
+them to find documents containing both terms, take the union to find documents containing either.
+
+**Prefix searching.** Keeping tokens sorted gives log-time complexity when searching documents.
+Finds all documents with words starting with "c".
+
+Once the terms are in order, every term beginning with `c` sits in one contiguous run of the
+vocabulary. The query becomes a binary search for the first of them followed by a walk forward
+until the prefix stops matching, which costs the logarithm of the vocabulary plus one step per
+match. In an unsorted vocabulary the matching terms are scattered anywhere at all, and there is
+nothing to find them with except a full scan.
+
+**Suffix searching.** Take the token, reverse the string, and build a second inverted index.[^1]
+
+| Index | Term | Postings |
+|---|---|---|
+| Prefix | `apple` | `[10]` |
+| Suffix | `elppa` | `[10]` |
+
+This is how you search for, say, fruits ending in "berry". Every inverted index is sorted, and
+prefix scans over sorted terms are already cheap, so reversing the token converts a question about
+suffixes into a question about prefixes. The query reverses its own search string and runs an
+ordinary range scan against the second index. What it costs is index size, since the whole
+vocabulary is now stored twice.
+
+An index built this way discards information deliberately. Tokenisation decides where words begin
+and end and normally folds case, which means what gets stored is a normalised token rather than
+the text as it was written, and the posting list records nothing beyond the fact that a document
+contained a term. There is no way back to the original record from any of it. That makes a search
+index derived data: a projection of something held elsewhere, kept current by being fed that
+source's writes, and repaired after corruption or a change to the analysis rules by being deleted
+and built again from scratch. It is a poor choice of primary store for the same reason. Deleting
+and rebuilding is the standard answer to almost every problem a search index has, and that answer
+only makes sense while the real data is sitting somewhere else.
+
+## ==Apache Lucene==
+
+The most popular open source search index.[^2]
+
+Searching a field of free text and searching a field of coordinates are different problems, and
+Lucene carries a different index type for each of them. Text needs a vocabulary and posting lists.
+Numbers and coordinates need something built for ranges instead, since nobody asks which documents
+contain the number 47 so much as which documents hold a number between 40 and 50. A single query
+commonly touches several of these index types at once before anything comes back.
+
+Writes are buffered in memory and flushed to immutable segments, which are then merged in the
+background. That is LSM-like behaviour, though Lucene's own documentation never uses the term.[^3]
+Because a segment never changes once it has been written, a query can run against a fixed set of
+segments while indexing carries on underneath it, and a reader is never blocked waiting for a
+writer to finish. The cost is that an update writes a new entry and leaves the old one exactly
+where it was, and the space held by the superseded copy is not reclaimed until a merge gets round
+to it.
+
+That background merging happens on Lucene's schedule rather than yours, which is why
+Elasticsearch exposes `_forcemerge`, and why Elastic's own guidance is to run it only against an
+index that has stopped receiving writes.[^8] Force merging can produce segments above roughly
+5 GB, and a segment that large is never eligible for regular merging again. Soft-deleted documents
+then pile up inside it with nothing to clear them out, disk usage climbs and search gets slower.
+Merging down to a single segment can also need up to three times the shard's size in free space
+while it runs. The awkward part is that `_forcemerge` is exactly what people reach for when search
+feels slow, which is usually while the index is still being written to.
+
+Lucene is an embedded library. It runs inside a single JVM and indexes whatever that process hands
+it, knowing nothing about any other machine. Everything to do with running more than one of them
+belongs to whatever is wrapping it.
+
+## ==Elasticsearch==
+
+A convenience wrapper around Lucene for fast searching in distributed systems, adding a REST API,
+its own query language, managed replication and partitioning, and visualisation. Lucene still does
+the indexing and the matching underneath all of it. Elasticsearch supplies the machinery for
+spreading many copies of Lucene across a cluster and presenting them to a caller as one index.
+
+### Partitioning
+
+Elasticsearch keeps a <u>local index per shard</u> and not one global index. Each shard is a
+self-contained Lucene index holding a subset of the documents, and a single node commonly holds
+many shards.[^4]
+
+Each shard indexes only its own documents, which means term `c` appears in whichever shards happen
+to hold a document containing it, and there is no global posting list for any node to consult.
+Writes are cheap under that arrangement, because a document is indexed wherever it lands and no
+other node needs to hear about it. The cost lands on reads instead: the query has to go to every
+shard that could hold a match, and a coordinating node merges the results that come back.
+
+Try to keep all searches limited to one partition, for example by partitioning chat documents by
+`chatId`. Otherwise results have to be aggregated across shards.
+
+<!-- FIGURE: ShardFanout -->
+
+The width of that fan-out is `index.number_of_shards`, and it can only be set when the index is
+created. It cannot be changed afterwards, not even on a closed index.[^9] The default is 1 and the
+cap is 1024. Every query the index will ever serve is therefore priced by a number chosen at
+creation time, before there was any data in it and before anyone knew how large the corpus would
+eventually get. All three remedies involve copying the data: split to go up, shrink to go down
+once writes have stopped, or, failing either of those, reindex into a fresh index with corrected
+settings. Each one needs enough spare disk to hold both copies at once, and that is usually the
+constraint that bites before any of the others do.
+
+Elastic's own sizing guidance puts shards between 10GB and 50GB, with the per-shard document count
+below 200 million.[^10] Getting it wrong in either direction costs something. Searching a thousand
+50MB shards is substantially more expensive than searching one 50GB shard holding the same data,
+while very large shards make searches slower and recovery after a failure longer. Neither figure
+is a hard limit, and Elastic says as much — a shard can hold just over two billion documents in
+theory. What the numbers represent is where experience has put the trade-off between per-shard
+overhead and recovery time, and the right number for a particular index still depends on the
+documents in it and the shape of the queries hitting it.
+
+### Caching
+
+Normally a system caches a piece of the index, or a full query result. Elasticsearch caches parts
+of a query instead. A whole-result cache only pays off when exactly the same query comes back,
+whereas real queries tend to differ in one clause and share all the others. Caching per clause
+means the shared part is computed once and reused everywhere it turns up, however the clauses
+around it are varied.
+
+
+
+| Store | Optimised for | Access pattern it assumes | Gives up |
+|---|---|---|---|
+| **Inverted index** | term to document lookup | many terms, ranked results | being a source of truth; it is always derived |
+| **Time series** | appends at one edge, wide range scans | writes cluster at now, reads span time | general-purpose indexing |
+| **Graph** | following an edge | traversal, not scan | ordering and scan locality, since the pointers jump |
+| **Geospatial** | points near a point | two dimensions flattened to one | exactness, so a distance check always follows |
+
+## ==Time series databases==
+
+Good for time series and range data, which means logs, metrics, sensor readings and anything else
+that arrives stamped with a time. Implementations include TimescaleDB and InfluxDB. Apache Druid
+is often grouped with them, though it describes itself as a real-time analytics database and not a
+time series database.[^5]
+
+The workload has a shape that a general-purpose index handles badly. Almost every write is an
+append at the current instant, which on one large time-ordered index means every insert lands in
+the same place and that one region absorbs all of the contention. Almost nothing is updated after
+it arrives. Reads want the opposite thing: one or two columns across a contiguous stretch of time,
+and usually an aggregate over that stretch rather than the individual rows. An index built to find
+a single row by key is not doing useful work for either side of that, and there is nothing in the
+workload to stop it growing.
+
+### Optimising reads
+
+Only a couple of metrics matter at a time, so use column-oriented storage. Less data has to be
+cached, and what is cached sits together. A row holds every metric a sensor reported at that
+instant, which means a query interested in one of those metrics still drags all of the others off
+disk with it whenever rows are stored together. Storing each metric's values adjacently instead
+leaves a scan touching only the bytes it actually asked for.
+
+Use many small indexes in place of one large table with one big index. Each index then covers a
+narrow slice of time, which keeps it small enough to stay resident in memory and cheap enough to
+rebuild if it has to be.
+
+A hypertable is partitioned by time into chunks, and optionally by a second dimension such as
+sensor. A query for one metric over one hour touches a single chunk, which is small enough to
+cache whole.
+
+**Hypertable** and **chunk** are TimescaleDB's own terms: a hypertable partitions by time and
+optionally by another dimension, and each chunk holds a specific time range.[^5] Most reads and
+writes go to one chunk at a time, which is what makes caching the whole chunk affordable. The
+second benefit is exclusion. Each chunk advertises the time range it holds, and every chunk that
+does not overlap the query gets skipped before a byte of it is read. A query therefore costs
+roughly what the width of the range it asked for costs, regardless of how much history is sitting
+behind that range.
+
+Chunk width is `chunk_interval`, and it defaults to 7 days for a timestamp column. TimescaleDB's
+own sizing rule is narrower than the version that usually gets repeated. It is the *indexes* of
+the chunks *currently being ingested into* that should fit within 25% of main memory, sized
+against `shared_buffers`.[^11] PostgreSQL builds those indexes on the fly during ingestion, and an
+index that does not fit gets flushed to disk and read back continuously, spending exactly the I/O
+budget the partitioning was there to save. Changing the interval later applies only to chunks
+created after the change; existing chunks keep the boundaries they were created with. A badly
+chosen interval therefore stays in the data until it ages out of the retention window.
+
+### Optimising writes
+
+Ingest volume is high enough here that slow writes back up into everything else. Shard by
+`(sensor, time range)` for the best data locality.
+
+Sharding on `(sensor, time range)` puts the rows that a query will want next to each other before
+the query is ever asked. Underneath, each chunk is an LSM-tree in memory flushing to SSTables on
+disk. Readings land in whichever chunk owns the current time range, which keeps the write working
+set small, and keeps each chunk's own index small along with it.
+
+### Optimising deletes
+
+Deletes in LSM-trees and SSTables are as expensive as writes. A delete is itself a write, of a
+marker saying the row is gone, and the row survives on disk until compaction rewrites the file
+without it. Clearing a month of expired readings row by row therefore costs one write per row,
+followed by a rewrite of every file those rows lived in. Partitioning by chunk avoids all of it.
+The expired rows are exactly the chunks whose time range has passed, which lets a retention policy
+drop whole chunks without ever touching the rows inside them.
+
+## ==Graph databases (Neo4j)==
+
+A non-native graph database takes an existing database and writes a query language on top of it,
+so you can traverse the graph without thinking about the storage. It costs `O(log|E|) +
+O(log|N|)` for a relational implementation and `O(log|N|)` for a non-relational one, which is
+slow.
+
+The cost comes from the way a join finds a neighbour, which is by searching for it. A single hop
+probes the edge index for rows referencing this node, then probes the node index once for every id
+that came back. Both of those indexes are sized by the whole graph rather than by the part of it
+being traversed, which means a hop gets more expensive as entirely unrelated regions of the graph
+grow, even though the node in hand still has exactly the three friends it always had.
+
+### Native implementation
+
+`O(1)` across a single edge, using <u>index-free adjacency</u>.[^6] The cost compounds with hop
+count, so the constant is per edge and not per traversal.
+
+**Nodes**
+
+| Address | Name | First edge |
+|---|---|---|
+| `0x001` | Joe | `null` |
+| `0x002` | Jane | `0x007` |
+
+**Edges**
+
+| Address | Points to | Next edge |
+|---|---|---|
+| `0x007` | `0x002` | `null` |
+| `0x008` | `0x001` | `null` |
+
+Each node stores the address of its first edge, and each edge stores the address of the next one.
+Because those are addresses in the store rather than keys to be looked up, following an edge is a
+pointer dereference and no search happens at all. The search a join would have performed was done
+once at write time and written into the record. A node with three edges costs three follows
+whether the store holds a thousand nodes or a billion.
+
+Some of that advantage is handed back by the memory hierarchy. The traversal jumps around the
+address space rather than reading through it, and the jumps are effectively random, which makes
+locality poor and puts a cache or page miss behind each one. A constant cost per hop also still
+compounds with depth, because the number of nodes reached widens at every level of the traversal.
+
+### ACID transactions in Neo4j
+
+Needs a WAL and locking. One logical write is rarely one record. Adding an edge means writing the
+edge and then splicing it into the list its node already points at, and a reader that arrives
+halfway through that splice follows a pointer into something unfinished. The log makes the whole
+change durable before any part of it is applied, and locks keep a second writer away from the
+records being spliced. Across several machines the same job falls to 2PL, with one of the locking
+nodes automatically assigned as coordinator.
+
+Graph databases come up less often than the rest of what is described here. When they do, it is
+usually a friend-of-a-friend query over a social graph like Facebook's, or a route across a road
+network like Google Maps. Both are traversals of unbounded depth over a structure that a join
+handles badly, which is the narrow case index-free adjacency was built for.
+
+## ==Geohashes and geospatial indexes==
+
+The problem is finding all the points within some radius of a location, which is the query sitting
+underneath anything that shows you what is near you: restaurants on Yelp, available drivers on
+Uber, other users on Tinder. The difficulty is that an ordinary index orders its keys along a
+line, and a radius query is a question about a plane. Sort on latitude and two points on the same
+parallel come out adjacent no matter how much ocean lies between them; sort on longitude and the
+same thing happens along a meridian. Flattening two dimensions into one always breaks some pairs
+that were close and joins some that were not, and every scheme in use accepts that and settles for
+getting most of them right.
+
+### Geohash and quad trees
+
+Assign every 2D point a single value, so that similar values are close to one another. The value
+comes from halving the space repeatedly and appending a character at each level to record which
+cell the point fell into. The resulting string is a path down the quad tree, which means two
+points sharing a prefix are two points that fell into the same box at every level that prefix
+covers.
+
+<!-- FIGURE: GeohashQuadTree -->
+
+Searching for all the points in box "CBA" means searching for all points with that prefix, so
+`"CBA" ≤ x ≤ "CBC"`. If the points are sorted, that is a binary search.
+
+Every point inside a box occupies one contiguous run of the sorted key space, so a box query is a
+range scan. The two-dimensional problem has become a one-dimensional one, and one-dimensional
+problems are what ordinary indexes are already good at.
+
+**Precision.** Each added character shrinks the cell by roughly a factor of eight, alternating
+4× and 8× per axis. At the equator, length 1 is roughly 5,009 km × 4,993 km, length 2 is 1,252 km
+× 624 km, and length 3 is 156.5 km × 156 km. A cell of about 1 km × 1 km is length 6.[^7] Two
+extra characters take the cell from roughly five thousand kilometres on a side down to roughly
+156, which is worth having in mind when picking a prefix length for a radius search.
+
+The approximation leaks at the edges. A cell is a box and a query is a circle, which leaves a
+prefix scan handing back points sitting in the corners of the box but outside the radius, and
+missing points well inside the radius that happen to fall in the box next door. The lookup
+compensates by searching the surrounding cells as well and recomputing real distances at the end.
+Prefix similarity does not track proximity in the general case either: two points a metre apart on
+opposite sides of a cell boundary can share no prefix at all. Searching a neighbourhood of cells
+rather than a single cell is what makes the whole thing correct.
+
+<!-- FIGURE: GeohashPrecision -->
+
+**Lookup procedure**
+
+1. Find points from the coordinates `(1.7, 1.7)`
+2. I'm in box B
+3. I'm in box BC
+4. I'm in box BCA
+5. Search BCA, BCB, BAC, BCC
+6. Take all points, calculate whether they are actually within the radius, return the result
+
+### Geo sharding
+
+Frequently there is too much data for one machine, and the concentrations are uneven, with empty
+regions sitting next to very dense ones. Splitting on a fixed prefix length gives every shard an
+equal amount of land and a wildly unequal amount of work, because a city centre and an empty
+stretch of sea get boxes of exactly the same size. Splitting on the key instead lets a dense cell
+divide into deeper prefixes while its sparse neighbours merge into one, which leaves each shard
+holding a comparable number of points rather than a comparable area of the map.
+
+[^1]: **Reverse token filter**, the Elasticsearch text analysis reference - confirms reversing
+      tokens as a real suffix-search technique. The filter "Reverses each token in a stream", and
+      "Reversed tokens are useful for suffix-based searches, such as finding words that end in
+      `-ion` or searching file names by their extension." Elasticsearch's filter is named
+      `reverse`.
+      [elastic.co](https://www.elastic.co/docs/reference/text-analysis/analysis-reverse-tokenfilter)
+
+[^2]: **The Apache Software Foundation Announces 10th Anniversary of Apache Lucene**, 27 September
+      2011 - source for Lucene's provenance. Written by Doug Cutting in the late 1990s: the ASF's
+      own announcement says the software "was first developed in 1997, entered the ASF as a
+      sub-project of the Apache Jakarta project in 2001, and became a standalone, Top-Level
+      Project (TLP) in 2005", while Elastic's anniversary piece dates the first public release to
+      April 2000. The commonly cited date of 1999 traces to a single conference slide and is not
+      supported by the ASF, which is why no year appears in the body above.
+      [news.apache.org](https://news.apache.org/foundation/entry/the_apache_software_foundation_announces16)
+
+[^3]: **IndexWriter**, the Apache Lucene 9.9.0 API documentation - source for the buffer-and-flush
+      mechanism: changes "are buffered in memory and periodically flushed to the Directory", and
+      the codec docs describe indexes evolving by "Creating new segments for newly added
+      documents" and "Merging existing segments". The behaviour matches an LSM-tree, but Lucene's
+      documentation never uses the term "LSM" or "log-structured merge tree"; that framing is
+      third-party.
+      [lucene.apache.org](https://lucene.apache.org/core/9_9_0/core/org/apache/lucene/index/IndexWriter.html)
+
+[^4]: **Clusters, nodes, and shards**, the Elasticsearch documentation - the unit is the shard,
+      not the node, which is a common slip: "Each index in
+      Elasticsearch is a grouping of one or more physical shards, where each shard is a
+      self-contained Lucene index containing a subset of the documents in the index." A single
+      node commonly holds many shards.
+      [elastic.co](https://www.elastic.co/docs/deploy-manage/distributed-architecture/clusters-nodes-shards)
+
+[^5]: **Understand hypertables**, the TimescaleDB documentation - confirms "hypertable" and
+      "chunk" as TimescaleDB's own terminology, and the partitioning model: hypertables are
+      "PostgreSQL tables that automatically partition your time-series data by time and optionally
+      by other dimensions", with each chunk holding "data from a specific time range". Separately,
+      Apache Druid's own homepage describes it as "a high performance, real-time analytics
+      database", not a time series database, which is why it is qualified above.
+      [tigerdata.com](https://www.tigerdata.com/docs/use-timescale/latest/hypertables)
+
+[^6]: **Graph-Native Memory Architecture**, Neo4j - confirms index-free adjacency as Neo4j's own
+      term: "Graph databases use index-free adjacency—each node directly references its
+      neighbors." Neo4j's own performance table gives `O(1)` for a direct connection against
+      `O(log n)` for the relational equivalent. Scope limit worth carrying: the same table gives
+      multi-hop traversal as `O(k)` for 2 hops and `O(k⁶)` for 6, where `k` is the average number
+      of connections per node, so `O(1)` is per hop rather than per traversal.
+      [neo4j.com](https://neo4j.com/labs/agent-memory/explanation/graph-architecture/)
+
+[^7]: **Geohash grid aggregation**, the Elasticsearch reference - carries the precision table.
+      Worst case at the equator: length 1 = 5,009.4 km × 4,992.6 km, length 2 = 1,252.3 km ×
+      624.1 km, length 3 = 156.5 km × 156 km, length 5 = 4.9 km × 4.9 km, length 6 = 1.2 km ×
+      609.4 m. Each added character shrinks the cell by roughly a factor of 8, alternating 4×
+      and 8× per axis, which is a good deal faster than intuition suggests.
+      [elastic.co](https://www.elastic.co/docs/reference/aggregations/search-aggregations-bucket-geohashgrid-aggregation)
+
+[^8]: **Elastic's force merge API reference**, the operation page for `_forcemerge`, which carries
+      Elastic's strongest warning. It supplies the rule that force merge belongs only on a
+      read-only index, and the reason: segments above roughly 5 GB are never eligible for regular
+      merging again, so soft-deleted documents accumulate and search degrades. A force merge down
+      to a single segment can temporarily need three times the shard's size in free space.
+      [elastic.co](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-indices-forcemerge)
+
+[^9]: **Elastic's "Index modules" settings reference**, the canonical list of static versus
+      dynamic index settings. It supplies the constraint that `index.number_of_shards` can only be
+      set at index creation and cannot be changed afterwards, not even on a closed index, along
+      with the default of 1 and the cap of 1024. Elastic's "Size your shards" page supplies the
+      remedies: split to go up, shrink once writes have stopped, or reindex into a fresh index,
+      and notes that shards are immutable in size, so an index must be copied with corrected
+      settings and there has to be disk enough for the copy.
+      [elastic.co](https://www.elastic.co/docs/reference/elasticsearch/index-settings/index-modules)
+
+[^10]: **Elastic, "Size your shards"**, the production-guidance page carrying the sizing rule of
+      thumb: 10GB to 50GB per shard with fewer than 200 million documents. It is explicit that
+      neither figure is a hard limit, a shard can hold just over two billion documents in theory,
+      only where experience puts the trade-off between per-shard overhead and recovery time. It
+      also supplies the two-sided cost: a thousand 50MB shards are substantially more expensive to
+      search than one 50GB shard holding the same data, while very large shards slow searches and
+      lengthen recovery.
+      [elastic.co](https://www.elastic.co/docs/deploy-manage/production-guidance/optimize-performance/size-shards)
+
+[^11]: **Tiger Data (TimescaleDB), "Size hypertable chunks"**, the vendor's sizing page for
+      `chunk_interval`. It supplies the 25% rule, more narrowly than the folklore version: it is
+      the indexes of the chunks currently being written to that must fit within 25% of main
+      memory, sized against `shared_buffers`, because PostgreSQL builds those indexes during
+      ingestion and an index that does not fit is constantly flushed to disk and read back. It
+      also gives the default interval of 7 days and the warning that changing it affects only new
+      chunks.
+      [tigerdata.com](https://www.tigerdata.com/docs/learn/hypertables/sizing-hypertable-chunks)
+
+## Related
+
+- [[Storage and Retrieval]], LSM-trees and column-oriented storage, which these systems reuse.
+- [[Stream Processing]], where CDC keeps a search index in sync.

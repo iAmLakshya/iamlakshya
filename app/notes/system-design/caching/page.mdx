@@ -1,0 +1,261 @@
+import { Mark } from "@/components/notes/mark";
+import { CacheTopology, ThunderingHerd, WriteStrategies } from "@/components/notes/diagrams";
+
+export const metadata = {
+  "title": "Caching — System Design Notes",
+  "description": "Where a cache sits, what to cache, the three write strategies and what each one costs"
+};
+
+# Caching
+
+## <Mark>Distributed caching</Mark>
+
+Caching is an application of the memory hierarchy.
+
+Each level down is larger, cheaper per byte and slower: per-core L1 and L2, then an L3 shared
+across cores, then main memory, then disk. A distributed cache adds one more rung to that ladder,
+above the database, and it is there for the same reason a CPU has an L1 at all. The hot working
+set goes in the fastest thing big enough to hold it, and everything else falls through to the
+level below.
+
+A cache hit is a memory lookup. A miss pays for that lookup anyway, and then for everything the
+cache was supposed to prevent: parsing the query, walking the index, reading pages off disk,
+sending the result back, and writing the value in on the way out. A miss therefore costs strictly
+more than having no cache at all, which is why the hit rate decides whether the whole arrangement
+was worth building.
+
+What a cache buys is faster reads and writes, and less load on whatever sits behind it. The
+reduction in load is frequently worth more than the latency, because a database that is only being
+asked the hard questions can serve a great deal more traffic than one answering the same easy
+question over and over. What it costs is the price of a miss, and a consistency problem whose
+difficulty scales with how much correctness the application actually needs.
+
+## What to cache
+
+Anything computationally expensive, or anything that moves a lot of data over the network.
+Database results are the common case: what gets avoided there is a query plan and an index walk on
+a machine that every other service is already queueing behind. Application-server computation
+comes next, where the expense is CPU rather than IO, whether that is a rendered page or an
+aggregate over a result set nobody wants recomputed once per request. Static content is easiest of
+all, since it is immutable in practice and carries no consistency problem, which is also why it
+tends to end up on a CDN and never reach the application's cache at all.
+
+Expense on its own does not settle what belongs in the cache, though. A cache only pays for itself
+when the same thing is asked for repeatedly, and plenty of expensive queries are asked exactly once
+each. The quantity worth thinking about is the cost of producing a result multiplied by how often
+that same result gets asked for again before it goes stale.
+
+## Where the cache sits
+
+### Server-local caching
+
+Happens on the application server, and on database nodes and message brokers too. The value sits
+in the same process as the code that wants it, or at least on the same machine, which means a hit
+is a memory read and there is no network call at all.
+
+Total cache size grows with the number of servers, and so does the duplication. Ten servers
+holding the same hot key hold ten copies of it, which means the amount of distinct data cached is
+only ever one server's worth, however many servers are running. Each of them pays its own miss to
+populate its own copy, and a server newly added to the fleet starts with nothing in it and has to
+warm up under live traffic.
+
+Invalidating a key means reaching every server that might be holding it. That fan-out has to be
+built, and then kept correct as the fleet changes shape.
+
+### Global caching layer
+
+A tier of its own that every server talks to over the network. It scales independently of the
+number of application servers, for both partitioning and replication, so capacity grows by adding
+cache nodes, and a single copy of a hot key serves the whole fleet. One invalidation then covers
+everybody rather than n of them. The costs are an extra network call on every lookup, and a good
+deal more that can go wrong, since the cache tier is now a distributed system in its own right
+with its own memory pressure and its own disk IO to worry about.
+
+Choosing between the two is mostly a matter of measuring the hot set against one server's memory.
+A hot set that fits comfortably in every server's heap belongs local, because a memory read in the
+same process is as fast as this gets, and invalidation is not much of a burden when the underlying
+data barely changes anyway. A hot set larger than a single machine has to live in the global
+layer. So does anything expensive enough to be worth computing once for the whole fleet rather
+than once per server, and anything that has to look identical no matter which server a request
+lands on.
+
+Either arrangement puts faster storage closer to the client and takes load off everything behind
+it. Neither removes the two obligations that come with having a cache at all: deciding what
+happens when it fills up, and deciding what happens when the underlying data changes.
+
+<CacheTopology />
+
+## Eviction
+
+A cache is a fixed quantity of memory holding an unbounded quantity of data, so something has to
+go when it fills. Redis exposes that decision as `maxmemory-policy` and offers ten settings:
+`noeviction`, then `allkeys-` and `volatile-` variants of LRU, LRM, LFU and random, plus
+`volatile-ttl`.[^1] The `allkeys-` policies consider the whole keyspace. The `volatile-` ones only
+touch keys that were given an expiry, so an instance holding cached values alongside durable ones
+can be told to sacrifice only the first kind.
+
+| Scope | LRU | LFU | Random | TTL | Nothing |
+|---|---|---|---|---|---|
+| **Whole keyspace** | `allkeys-lru` | `allkeys-lfu` | `allkeys-random` | - | - |
+| **Keys with an expiry** | `volatile-lru` | `volatile-lfu` | `volatile-random` | `volatile-ttl` | - |
+| **Neither** | - | - | - | - | `noeviction` |
+
+`allkeys-lrm` and `volatile-lrm`, least recently modified, fill the remaining two of the ten.
+
+Open-source Redis defaults to `noeviction`, the one entry on that list that does not evict
+anything. A full instance stops making room and starts refusing writes instead, which surfaces as
+errors on `SET` rather than as a quietly declining hit rate. The fix is a single configuration
+line, provided somebody knew to write it. Redis Enterprise ships `volatile-lru` instead, so what
+happens to a full instance depends on which Redis is running underneath it.
+
+LRU here means a sample rather than a strict ordering. Redis says so plainly, that the algorithm
+"uses an approximation of the least recently used keys rather than calculating them exactly", and
+the same holds for LFU. What happens on eviction is that a handful of candidate keys are drawn and
+the worst of that handful goes, which is close enough to true LRU for a cache and far cheaper than
+maintaining a global order over every key in the instance.
+
+memcached splits its memory into slab classes by item size and cuts chunks out of 1 MB pages. The
+default item size limit is 1 MB to match, adjustable between 1k and 1G with `-I`. Once a page has
+been assigned to a class it is never moved to another, and each class keeps its own LRU. A class
+that runs out of chunks evicts from itself, and if nothing in it has expired it takes something
+that is still live, since the documentation is explicit that it will "evict" an item which has not
+yet expired.[^2]
+
+The consequence is that an instance can throw away hot session keys while still reporting free
+memory overall. The free memory is real enough, but it is in the wrong slab class — pages claimed
+some time earlier by a batch of large objects, and never reassigned since, because a page belongs
+to the class that first took it for as long as the process runs.
+
+## <Mark>Distributed cache writes</Mark>
+
+There are three strategies, and what separates them is where a write lands first and how long the
+other copy is allowed to disagree with it.
+
+
+
+<WriteStrategies />
+
+### Write around cache
+
+The database is the source of truth. Writes go straight to it and the cache is left untouched,
+which means the write path is identical to that of an uncached system. The value that was just
+written is not in the cache, and the next reader of that key pays the full cost of fetching it.
+
+The harder decision is what to do about any stale copy already sitting there. One option is to
+remove the key on every write, which requires knowing where the key lives and guarantees a miss
+immediately afterwards. The other is to leave it alone and let a TTL expire it, which means serving
+data already known to be wrong until the timer runs out. Neither is free, and the choice between
+them turns on how quickly the application genuinely needs to see the new value.
+
+A TTL is itself a trade between hit rate and staleness, and there is no setting that gives both.
+Short expiries kill most values before anybody reads them a second time, so misses are constant
+and the cache barely earns its keep. Long expiries raise the hit rate and widen the window in
+which every reader sees the old value.
+
+What write-around has going for it is that it requires no coordination whatsoever. It can be put
+in front of a system that already works, with no change to the write path and nothing new that has
+to be kept in step.
+
+### Write through cache
+
+Every write goes to both places. The cache therefore never disagrees with the database, no reader
+sees a version skew, and nothing held in the cache is ever stale.
+
+Making that true is the difficult part. Without a two-phase commit there is a window in which one
+of the two writes has applied and the other has not, and nothing exists to reconcile them
+afterwards; cache and database simply hold different values until something overwrites one of
+them. With a two-phase commit the two either both commit or neither does, and the price is that
+every single write pays for the protocol's extra round trips. Either way, this is the slowest of
+the three strategies on the write path, because the write is bounded by the database whatever else
+happens around it.
+
+### Write back cache ✓
+
+The write lands in the cache and the caller is acknowledged straight away. The database catches up
+asynchronously afterwards. Nothing on the request path touches the database at all, so latency is
+bounded by a memory write and a network hop rather than by a disk write and a transaction commit
+sitting behind whatever queue the database is currently working through. Outbound writes coalesce
+as a side effect: a key updated several times between flushes turns into a single database write.
+What the database holds is a version of the world that trails by however much of the backlog
+remains unflushed, and anything reading the database directly sees that lag.
+
+The cost is durability. Everything that has been acknowledged but not yet flushed exists in
+exactly one place, which is the cache's memory. Losing a cache node loses those writes, and loses
+them after the client has already been told they succeeded. That is worse than an outright
+rejection, because a rejected write gets retried and a silently lost one does not.
+
+The obvious remedy is to copy each entry to a second cache node before acknowledging, which
+removes the single-node failure case and gives back a good part of the latency the strategy was
+adopted to gain. The other remedy sometimes suggested, holding a lock on the database to keep
+readers away from rows the cache has not flushed yet, is worse than the problem it solves. It puts
+the database back on the critical path and makes readers wait, inside a design whose entire
+purpose was to stop them waiting.
+
+### Summary
+
+| Strategy | Mechanism | Trade-off |
+|---|---|---|
+| **Write around** | Write like normal, cannot avoid the cache miss | Low complexity, fewer read benefits, no write penalty |
+| **Write through** | Super slow with 2PC, pretty slow without it | Writes much slower, consistent data, no miss |
+| **Write back** | Write directly to cache, async flush to the database | Writes and reads very fast, can lead to consistency issues |
+
+## Thundering herd
+
+A single key is hot, taking every request for some heavily viewed page, all served from the cache.
+It expires, or a write invalidates it. The next request misses and queries the database, as does
+the one a microsecond behind it, and every request arriving during however long the answer takes,
+because none of them can tell a query for that key is already in flight. Work done once and shared
+across all of them is now done once per request, the database slows under the load, and the
+slowdown lengthens the window that lets more of them in.
+
+The usual answer is a lock held in the cache, admitting one query per key to the database.
+Whichever request misses first takes the lock and goes to the database, and the rest wait for the
+value to appear. The coordination stays inside the cache tier, which is already the one component
+that sees every request for that key, so nothing new has to be introduced to arrange it. It does
+not make any individual request faster, though. Every request that arrived during the window still
+waits out the full recomputation, and what has been protected is the database rather than the
+latency.
+
+A cheaper measure, where it applies, is jitter. Keys populated by the same event and given the
+same TTL all fall due at the same instant, which is what produces a synchronised wave of misses in
+the first place. Adding a small random offset to each expiry spreads those misses across a stretch
+of time instead, and costs nothing beyond the randomisation.
+
+Probabilistic early expiration goes further than jitter, and has a proof behind it. Store ∆, the
+measured cost of the last recomputation, alongside the value. On each read, recompute early if
+`Time() - ∆β log(rand()) ≥ expiry`, where β defaults to 1. Every request, in the paper's own
+framing, "essentially pretends to be sometime in the future and if at that time the cache is
+expired then it regenerates the item".[^3] Because ∆ is measured rather than configured, an
+expensive value begins volunteering to refresh itself earlier than a cheap one does, without
+anybody tuning it per key. The property that makes the scheme deployable is that the parameter
+needs no relationship to the request rate at all, which the paper proves, so a key whose traffic
+moves by orders of magnitude never needs its configuration revisited.
+
+<ThunderingHerd />
+
+[^1]: **Redis, "Key eviction"**, the reference page for `maxmemory-policy`, listing the ten
+      policies and explaining that both LRU and LFU are sampled approximations, not exact
+      orderings. The default, `noeviction`, is not on that page but in the annotated `redis.conf`
+      in the redis/redis repository. Redis Enterprise ships `volatile-lru`, so the behaviour you
+      get depends on which Redis you are running.
+      [redis.io](https://redis.io/docs/latest/develop/reference/eviction/)
+
+[^2]: **memcached's man page and its "UserInternals" wiki page**, the project's own documentation
+      of slab allocation and eviction. The man page gives the item size limit, 1 MB by default and
+      adjustable from 1k to 1G via `-I`. The wiki supplies the behaviour that catches people out:
+      each slab class keeps its own LRU, pages are never reassigned between classes once
+      allocated, and a class out of chunks will evict an item that has not yet expired.
+      [github.com/memcached](https://raw.githubusercontent.com/wiki/memcached/memcached/UserInternals.md)
+
+[^3]: **Vattani, Chierichetti and Lowenstein, "Optimal Probabilistic Cache Stampede
+      Prevention"**, the VLDB 2015 paper that gives probabilistic early expiration its formal
+      treatment and proves the exponential gap distribution optimal. It supplies the rule itself,
+      recompute when `Time() - ∆β log(rand()) ≥ expiry`, where `∆` is the measured cost of the
+      last recomputation. It also supplies the property that makes the trick practical: the
+      parameter needs no tuning against request rate.
+      [vldb.org](https://www.vldb.org/pvldb/vol8/p886-vattani.pdf)
+
+## Related
+
+- [Storage and Retrieval](/notes/system-design/storage-and-retrieval), the storage layer a cache sits in front of.
+- [Database Comparisons](/notes/system-design/database-comparisons), which systems cache what.

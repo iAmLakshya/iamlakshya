@@ -1,0 +1,455 @@
+import { Mark } from "@/components/notes/mark";
+import { HdfsArchitecture, HdfsPipeline, JoinStrategy, MapReduceFlow, SparkLineage } from "@/components/notes/diagrams";
+
+export const metadata = {
+  "title": "Batch Processing — System Design Notes",
+  "description": "HDFS, HBase, MapReduce, the three batch join strategies, and where Spark improves on MapReduce"
+};
+
+# Batch Processing
+
+## <Mark>Hadoop</Mark>
+
+A distributed computing framework. Storage is HDFS. The compute half was MapReduce first, and is
+mostly Spark now.
+
+### HDFS
+
+A distributed file store with "rack aware" storage, which makes it fault tolerant.[^1]
+
+The machines in one rack share a switch and usually a power feed, which means racks tend to fail
+as whole units rather than one machine at a time. The failure to design against is therefore all
+the disks behind a single switch becoming unreachable together. A placement policy that treats
+every node as interchangeable can easily put all three copies of a block inside that one rack.
+HDFS avoids this by knowing which physical rack each node sits in and spreading the replicas
+across racks, which means losing a rack does not lose the block. The same knowledge cuts read
+latency as well, since a read can be served from the nearest replica, and bandwidth within a rack
+is high enough relative to bandwidth between racks that being nearer is worth measuring.
+
+None of this topology is discovered by HDFS. It has to be supplied by whoever configures the
+cluster, and if the mapping has drifted since machines were last physically moved, replicas will
+be placed somewhere other than where the policy intends. In practice the configuration is a
+script: `net.topology.script.file.name` points at an executable, Hadoop hands that executable
+batches of IP addresses, and it answers with paths of the form `/myrack/myhost`. If nothing is
+configured at all, every node reports the rack id `/default-rack`. A cluster in that state looks
+perfectly healthy and is placing all three replicas as though they shared a switch.[^8]
+
+<HdfsArchitecture />
+
+**Name node.** The name node is the index for the whole filesystem. It tells us all the replicas
+and the versions of files on them, and it keeps that metadata in memory, with a log on disk for
+fault tolerance.[^1] Holding it in memory is what makes a lookup cheap enough to sit in front of
+every file open in the cluster. The log is there for restarts: without it, a name node coming back
+up would have a cluster full of blocks and no way of telling which file any of them belonged to.
+On start-up it also asks each data node which files it holds and schedules replication where
+necessary, rebuilding its picture of the cluster from the nodes themselves rather than trusting
+its own last-known state. That maintenance then carries on for the life of the cluster. Whenever
+the number of replicas for a file on a data node is too low, another copy is scheduled, and the
+same mechanism covers a node that has stopped reporting in altogether.
+
+**Reading files.** Data in HDFS is read far more often than it is written, and the read path is
+shaped around that imbalance.
+
+1. Client asks the name node for the file location
+2. Name node responds with the best replica for that client
+3. Client caches the file location
+4. Client reads from the data node
+
+Step three is what keeps the name node off the data path. A client that already knows where its
+blocks live talks to the data nodes directly, which is why a single name node can front a cluster
+whose read throughput it would never have been able to proxy itself. The load on the name node is
+a function of how often files are opened, not of how many bytes are subsequently read out of them.
+
+**Writing files.** When picking the location of a replica, the name node tries to be rack
+aware.[^1]
+
+1. Client wants to write a file
+2. Name node: file will be on A, B, C
+3. Name node → client: primary A, secondary B, tertiary C
+4. Client writes to DN-A
+
+With the default policy and a replication factor of three, the first replica goes on the writer's
+own node. The other two go into a single remote rack, on different nodes there.[^1] Only two racks
+are involved rather than three. That keeps cross-rack traffic down to one hop during the write,
+and the cluster still survives losing either of the two.
+
+Clients write into a replication pipeline. The block leaves the client once, to A. A forwards it
+on to B while it is still receiving it, and B does the same for C. The client's uplink therefore
+carries the data a single time, and the copies are made as part of the transfer rather than in a
+separate pass afterwards.
+
+<HdfsPipeline />
+
+This is not strongly consistent. Replication can fail partway along the pipeline (`A ↛ B`, or
+`B ↛ C`), or the acknowledgement can be dropped, in which case the client tries again. Every hop
+is somewhere the block can end up durable on one node and missing on the next while the client has
+already been told the write landed. A dropped acknowledgement causes the reverse problem, where
+the client retries a write that had in fact already succeeded.
+
+**High availability HDFS.** A single name node is a point of failure. Losing it does not lose any
+data, because the blocks are all still sitting on data nodes, but nothing left in the cluster can
+say which blocks belong to which file, so in practice the whole filesystem is unreadable until a
+name node is back.
+
+High availability replaces the single NameNode with a primary and a standby. Both write to a
+distributed log held in ZooKeeper, which gives them strongly consistent consensus on the edit
+stream, and the standby applies that log to keep its own state machine current. A failover
+promotes the standby, which already holds the namespace in memory.
+
+Much of the infrastructure described in the rest of this chapter is built on top of HDFS, and
+inherits its rack awareness without ever having to configure the topology again.
+
+## <Mark>HBase</Mark>
+
+### Problems with Hadoop
+
+HDFS offers no way to make an ad hoc update to a single file and edit one piece of data in place.
+The whole file has to be written out again. A one-byte correction inside a terabyte file costs a
+terabyte of rewriting and re-replication, which rules out any workload where individual records
+are amended.
+
+HBase is a database built on top of Hadoop. It gives quick queries and single-key updates through
+an LSM structure: a write is an append into memory, flushed out later as a sorted file, and
+nothing is ever rewritten in place. Batch processing stays fast through data locality, which here
+means column-oriented storage and range-based partitioning.
+
+### Data model
+
+A wide key store (NoSQL), similar to Cassandra. No dedicated cluster key, because partitioning
+is range based.
+
+### Architecture
+
+A master node tracks which region server owns which key range and hands clients a target.
+ZooKeeper holds that assignment and elects a standby master. Each region server runs on the same
+machine as an HDFS DataNode, so a region reads its blocks from local disk rather than over the
+network.
+
+HBase uses column-oriented storage, which means it only fetches the rows wanted, caches statistics
+per column, compresses per column, and suits analytics queries and batch processing.
+Range-based partitioning keeps related data close: think of timestamps, which would otherwise have
+completely different hashes. A scan over last Tuesday touches a contiguous run of keys on one
+region server, whereas hash partitioning would have scattered those same rows across every node in
+the cluster.
+
+Contiguity cuts the other way as well. Keys that sort together also land together, so a write
+stream whose key increases monotonically — a timestamp being the obvious case — points every
+incoming write at whichever region currently owns the top of the range. The reference guide does
+not hedge about this. Hotspotting is a large amount of client traffic directed at one node or a few
+nodes of a cluster; the traffic overwhelms the single machine responsible for hosting that region,
+and the result is degraded performance and possibly an unavailable region. With monotonically
+increasing row keys, "this will happen".[^4] The advice that follows is to avoid using a timestamp
+or a sequence as the row key at all.
+
+The mitigations named in the guide all work by making the key sort somewhere other than where it
+would naturally fall. Salting prefixes the row key with a randomly assigned value, which spreads
+the writes across regions but gives up the ability to reconstruct a key for a point lookup.
+Hashing is the variant that fixes that, because the prefix is deterministic, so a Get can
+recompute it and still find its row. Reversing the key so that the least significant digit comes
+first is cheaper to reason about, on the grounds that the least significant digit is the part that
+changes most often, and what it costs instead is row ordering, which goes entirely.[^4] OpenTSDB
+is the standard worked example, with keys of the form `[metric_type][event_timestamp]`. The
+timestamp is still in the key, just not in the leading position.
+
+Both things are true at once, and they do not reconcile into a rule. Range partitioning earns its
+keep because keys that are near each other in value sit near each other on disk, and that is why a
+time-range scan is cheap here. The same mechanism is what funnels a monotonic write stream onto
+one server. Designing the schema for fast scans therefore makes the writes worse, and designing it
+to spread the writes makes the scans worse. Which way to lean depends on whether the table is
+mostly being filled or mostly being read, and on how much of the ability to scan by time can
+reasonably be given up.
+
+Regions split as they grow. The check runs on the region server itself after every flush or
+compaction, with the master taking no part in it, and the headline threshold is
+`hbase.hregion.max.filesize`, which defaults to 10737418240 bytes, or 10 GiB. Once the sum of the
+sizes of a region's HFiles exceeds that, the region is split in two.[^5] That number matters less
+than its prominence suggests, because the default policy is `SteppingSplitPolicy` rather than a
+flat constant size, so a small table will split well below 10 GiB. The guide's own sizing advice,
+meanwhile, asks for regions between 10 and 50 GB once a table has settled.[^5]
+
+For a typical application-level database, HBase is not as fast as Cassandra. However, if the
+requirement is to store and <u>modify</u> big data on HDFS so that analytical batch queries can
+run over it afterwards, HBase may well be the better option. Sensor readings and analytics
+workloads are the usual examples.
+
+
+
+| | HDFS alone | HBase | Cassandra |
+|---|---|---|---|
+| Update one record | rewrite the whole file | quick key update via LSM | quick key update via LSM |
+| Partitioning | by block, rack aware | range based | by cluster key, hash ring |
+| Batch scan locality | good | good, range partitioning keeps related keys together | poor, hashing scatters them |
+| Best at | storing files to be read whole | modifying big data you also want to scan | very high single-partition throughput |
+
+## <Mark>MapReduce</Mark>
+
+Performs batch processing of big datasets that are already in HDFS. It can run arbitrary code. You
+define a mapper and a reducer, and anything expressible as "transform each record, then combine the
+records that share a key" fits the shape.
+
+```
+Mappers:  Obj              ⟶  (Key, Value)
+Reducers: List(Key, Value) ⟶  (Key, Value)
+```
+
+The scheduler runs computations on the same nodes that hold the data, and failed mappers and
+reducers are restarted independently.[^2]
+
+Network cost is what motivates running the computation next to the data. Input to a batch job is
+measured in terabytes while the mapper that processes it is a few kilobytes of code, so shipping
+the code to whichever machine already holds the block is close to free by comparison. The
+alternative — shipping blocks to whichever machine happens to have a free slot — means a
+cross-rack transfer for every block, and at tens of thousands of blocks the inter-rack links
+saturate long before the CPUs are busy. The scheduler therefore asks where the replicas live and
+places the map task on one of those nodes. Because a block has three replicas, it has three
+chances of finding a free slot without moving any data at all.
+
+<MapReduceFlow />
+
+Between map and reduce sits the shuffle, which is usually where most of a job's cost ends up. A
+mapper emits key-value pairs in whatever order its own input block happened to be in, whereas a
+reducer needs every value for a given key, from every mapper, gathered in one place. The shuffle is
+that redistribution: each mapper partitions its output by key, and each partition then has to reach
+the single reducer responsible for it. The traffic is all-to-all, M mappers by R reducers, with the
+entire intermediate dataset crossing the network. Map and reduce are local and embarrassingly
+parallel, so both get faster as machines are added. The shuffle does not improve in the same way,
+because more machines mean more connections and more opportunity for skew. A job that reads on
+paper like two cheap passes over the data will often spend most of its wall clock time in the
+middle stage.
+
+Sorting is what keeps memory use on the reduce side flat. A reducer has to see all the values for
+one key together, and the obvious way to arrange that is a hash table keyed on every distinct key
+in the partition, held open until the input runs out. Memory then scales with the number of
+distinct keys, and a partition with more keys than will fit simply fails. Sorting removes that
+constraint: it uses much less memory and is easier to flush, because nothing has to be kept in
+memory until the end. The sort itself is an `O(n)` merge join. Every mapper's output arrives
+already sorted by key, the reducer merges those streams with a heap, and each key's values
+therefore arrive contiguously, so only one group is ever open at a time.
+
+**Job chaining** links MapReduce jobs together. Anything more involved than a single map and a
+single reduce becomes a sequence of jobs, where the HDFS output of one is the input of the next.
+
+MapReduce works for scheduled batch processing over big data, and job chaining and data joins
+extend what it can express. The performance costs are real enough, however, that it is frequently
+not the best tool for the job.
+
+## <Mark>Batch job data joins</Mark>
+
+During batch computation, multiple datasets often need joining. The join key decides which records
+have to meet, and getting those records onto the same machine is the expensive part. Each of the
+strategies below is a different answer to that single problem, and what separates them is how much
+they are willing to assume about the inputs before they start. The same logical join can therefore
+cost a full shuffle of both sides, or almost nothing, depending on where the data already happens
+to be sitting.
+
+
+
+| Strategy | Requires | Network cost | Memory ceiling |
+|---|---|---|---|
+| **Join on disk** | both sides already partitioned and sorted on the join key | none beyond the usual reduce | none |
+| **Broadcast hash** | one side fits in memory | the small side, to every partition | the small side |
+| **Partitioned hash** | both sides partitioned identically on the join key | matching partitions only | one partition pair |
+| **Sort merge** | nothing | at least one whole dataset, plus a full sort | none, it merges on disk |
+
+### Sort merge join
+
+Merging a set of sorted lists, which can be done with a heap. The sort happens in the shuffle
+stage. Both sides are repartitioned by the join key, so matching records land on the same reducer
+and arrive there in key order, and the reducer then walks the two streams in lockstep.
+
+This strategy can always be used, because the data can always be repartitioned by the join key and
+the merge can be done entirely on disk, under no memory constraint. It assumes nothing whatsoever
+about how the inputs were written, which is both its appeal and the reason it is extremely slow.
+All the data has to be sorted by join key unless it happens to be indexed already, and at least
+one whole dataset has to travel over the network, possibly both, depending on how the two were
+partitioned to begin with. That costs a full shuffle and a full sort of both inputs, even for a
+query that ends up touching only a small fraction of one of them.
+
+### Broadcast hash join
+
+Sends the entire small dataset to all partitions and does a hash join. Each partition builds a hash
+table of the small dataset in memory and then makes a linear scan of the big dataset, joining with
+`O(1)` lookups. The big dataset is neither sorted nor moved anywhere.
+
+The assumption here is that one of the two datasets fits in memory. Not in aggregate across the
+cluster, but on every node at once, alongside whatever else that task is already holding. Where
+the assumption holds, this is the cheapest join available: the only network traffic is the small
+dataset multiplied by the number of partitions, which for a dimension table joined against a fact
+table is negligible. Where it does not hold, the task has nowhere to put the hash table and fails
+outright, which is why the size of the small side is worth checking before committing to the
+strategy.
+
+### Partitioned hash join
+
+For when both datasets are too big for memory but are partitioned the same way, so that
+individual partitions fit. Partitions are sent over the network instead of whole datasets.
+
+Everything rests on the two sides being partitioned identically on the join key. If key `k` lands
+in partition `i` on both sides, one enormous join decomposes into many independent per-partition
+hash joins, with no global sort and no all-to-all shuffle. The catch is that co-partitioning is a
+property of how the data was written out, so it is not something a job can arrange for itself at
+read time. Either the layout is already there, or this strategy is unavailable.
+
+**Choosing.** If both datasets already arrive partitioned and sorted, or indexed, on the join key,
+then nothing needs arranging at all. The data goes to the reducer as normal and the join happens on
+disk, with no stage paying for a sort. It is an uncommon position to be in, because it requires
+whatever wrote the data out to have had this particular join in mind at the time.
+
+Failing that, size is the first thing to check, because a side small enough to broadcast removes
+the shuffle for the large side completely. The test is against the memory available to one task on
+one node, and the cluster total is irrelevant to it. It is also an unforgiving test, because a
+task which cannot fit the hash table stops rather than slowing down. Where both sides are
+genuinely large, the remaining question is whether they were written out partitioned identically
+on the join key, which turns one big join into a lot of small independent ones.
+
+Sort merge join handles everything else. It demands nothing of the inputs, and that is exactly why
+it is slow, because everything the other two strategies get for free from the layout, it has to
+construct at run time. Since the layout is already fixed by the time a job runs, the decisions that
+determine what a join costs were taken much earlier, when the data was written out.
+
+<JoinStrategy />
+
+## <Mark>Spark</Mark>
+
+### Issues with MapReduce
+
+The flaws sit at the seams between jobs. Chained jobs do not know about one another, so there is a
+lot of waiting: the second job cannot start until the first has finished completely, even for the
+partitions it finished an hour earlier. Each job requires a mapper and a reducer whether or not the
+computation needs both halves, which drags in a lot of unnecessary `n log n` sorting on stages that
+were never going to group anything.
+
+The heaviest cost is disk, because every job materialises its intermediate state. Each job in the
+chain writes its output to HDFS as a full intermediate dataset, serialised to disk and replicated
+across nodes for a durability guarantee it will never need, and the next job then reads it straight
+back. A five-job chain pays four round trips through the replicated filesystem for data whose
+entire purpose is to be consumed by the following stage and then deleted. The framework has no way
+of knowing that, since each job is an independent program whose only contract with the next is a
+path.
+
+### Why Spark is better
+
+Spark only reads and writes disk at input and output. Intermediate state stays in memory as an RDD
+(resilient distributed dataset), and the stages are linked into a graph that the engine can see
+whole, so it never has to treat any one stage as a self-contained job with a durable output.
+Nothing is given up in doing so, because the graph records how every partition was derived, and a
+lost partition can be recomputed from its parents instead of fetched from a replica.
+
+<SparkLineage />
+
+The shuffle itself does not go away. Spark SQL exposes its width as
+`spark.sql.shuffle.partitions`, which has defaulted to 200 since version 1.1.0 and has not moved
+since.[^6] Two hundred is not a considered answer for any particular dataset, and the current
+guidance is not to treat it as one. The recommended approach is to set
+`spark.sql.adaptive.coalescePartitions.initialPartitionNum` high enough and let adaptive execution
+coalesce post-shuffle partitions using map output statistics gathered at run time.[^6] On clusters
+where adaptive execution has not been turned on, though, the fixed default is what a job gets.
+
+### Spark fault tolerance
+
+Memory is not durable, so the dependency graph has to provide what replication provided in
+MapReduce. Spark records a dependency type at each stage.[^3]
+
+- **Narrow**, computation on one node
+- **Wide**, relies on data from other nodes
+
+Lost computation is rerun, parallelised across other nodes, and for narrow dependencies that works
+well. The inputs to a narrow stage sit on a single node, so recovering a lost partition is a
+bounded piece of local work, and several partitions can be recovered at the same time on different
+machines. A wide dependency behaves much worse under the same treatment. The lost partition drew on
+every partition of the stage before it, so recomputing it means recomputing that entire stage, and
+if that stage was also wide, the recovery keeps walking backwards through the graph. A checkpoint
+taken after a wide computation gives that walk somewhere to stop: the stage is written to disk as a
+temporary materialisation, and recovery reads from disk.[^3]
+
+The documentation is more specific about this than the general advice suggests, although it stops
+short of giving a number. `localCheckpoint()` exists for precisely this case, described as being
+for users who wish to truncate RDD lineages while skipping the expensive step of replicating the
+materialised data in a reliable distributed file system, and as useful for RDDs with long lineages
+that need to be truncated periodically. It writes to ephemeral executor storage, so it trades fault
+tolerance for speed. That sounds like a strange thing to say about a fault tolerance mechanism, but
+the lineage is still sitting underneath it, and the checkpoint is only an optimisation on top.[^7]
+The plain `checkpoint()` has a trap attached. It must be called before any job has been executed on
+the RDD, and the documentation strongly recommends persisting that RDD in memory first, because
+otherwise saving it to a file will require a recomputation.[^7] Recovery time, in the streaming
+guide's phrasing, is proportional to the dependency chain.
+
+None of that says how long a lineage has to be before it counts as long. That has to be worked out
+empirically, by watching recovery times climb across reruns. The API reference gives no threshold,
+and neither does the RDD paper, which recommends checkpoints for long lineage chains and leaves it
+there.[^3][^7]
+
+### Trade-off
+
+Spark is much faster than MapReduce, largely because intermediate state stays in memory and the
+mandatory sort at every step goes away. Nodes also start computing as soon as their inputs are
+ready, rather than waiting for a whole preceding job to finish. What it uses in exchange is memory,
+because the working set has to fit. The cluster has to hold the largest intermediate state the
+graph produces, which is a different quantity from the size of the input, and it has to hold that
+for the duration of the job. A working set larger than the cluster's memory will spill to disk, and
+a good share of the advantage over MapReduce goes with it.
+
+[^1]: **HDFS Architecture**, the Apache Hadoop project documentation - the design document for
+      the Hadoop Distributed File System. Source for rack-aware replica placement ("The purpose
+      of a rack-aware replica placement policy is to improve data reliability, availability, and
+      network bandwidth utilization") and for the NameNode keeping "an image of the entire file
+      system namespace and file Blockmap in memory". Hadoop's own term for the on-disk log is
+      the **EditLog**, not a WAL, and it is paired with a periodic FsImage checkpoint that these
+      notes omit.
+      [hadoop.apache.org](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html)
+
+[^2]: **MapReduce: Simplified Data Processing on Large Clusters**, Jeffrey Dean and Sanjay
+      Ghemawat, Google, OSDI 2004 - the original paper. Source for data locality ("attempts to
+      schedule a map task on a machine that contains a replica of the corresponding input data")
+      and independent task restart. Note the asymmetry: completed *map* tasks are re-executed on
+      worker failure because their output sits on the failed machine's local disk, while
+      completed *reduce* tasks are not, because their output is already in the global
+      filesystem.
+      [research.google](https://static.googleusercontent.com/media/research.google.com/en//archive/mapreduce-osdi04.pdf)
+
+[^3]: **Resilient Distributed Datasets: A Fault-Tolerant Abstraction for In-Memory Cluster
+      Computing**, Zaharia et al., UC Berkeley, NSDI 2012 - the RDD paper. Source for the
+      narrow/wide dependency split, defined there as whether "each partition of the parent RDD
+      is used by at most one partition of the child RDD". Note that checkpointing is an
+      optimisation rather than a requirement: the paper says lineage "can always be used to
+      recover RDDs after a failure", and recommends checkpoints only for long lineage chains.
+      [people.csail.mit.edu](https://people.csail.mit.edu/matei/papers/2012/nsdi_spark.pdf)
+
+[^4]: **Apache HBase Reference Guide** - the project's own documentation. Its rowkey design
+      chapter states that monotonically increasing row keys pound a single region and node in
+      lock step, and names salting, hashing and key reversal as the three standard mitigations.
+      [hbase.apache.org](https://hbase.apache.org/docs/regionserver-sizing)
+
+[^5]: **Apache HBase Reference Guide** - including the generated `hbase-default.xml` table. It
+      gives `hbase.hregion.max.filesize` a default of 10 GiB and describes the split check
+      running after each flush or compaction. The default split policy is `SteppingSplitPolicy`
+      rather than a flat constant-size rule, so a small table splits earlier than the headline
+      figure suggests.
+      [hbase.apache.org](https://hbase.apache.org/docs/architecture/regions)
+
+[^6]: **Spark SQL performance tuning guide** - Apache Spark's own configuration reference. It
+      fixes `spark.sql.shuffle.partitions` at a default of 200, unchanged since Spark 1.1.0. Its
+      adaptive query execution section carries the more current guidance: set a large enough
+      initial partition count and let Spark coalesce post-shuffle partitions from map output
+      statistics at runtime.
+      [spark.apache.org](https://spark.apache.org/docs/latest/sql-performance-tuning.html)
+
+[^7]: **Spark ScalaDoc for `org.apache.spark.rdd.RDD`** - the API reference generated from
+      Spark's source comments. It names `localCheckpoint()` as the method for RDDs with long
+      lineages needing periodic truncation, and warns that `checkpoint()` should be paired with
+      an in-memory persist or the save forces a recomputation. Neither page states a
+      lineage-length threshold.
+      [spark.apache.org](https://spark.apache.org/docs/latest/api/scala/org/apache/spark/rdd/RDD.html)
+
+[^8]: **Hadoop rack awareness documentation** - the Apache Hadoop common guide to topology
+      configuration. It supplies the two mechanisms, `net.topology.node.switch.mapping.impl` for
+      a Java implementation and `net.topology.script.file.name` for an external script, the
+      script contract (IP addresses on ARGV, batched per `net.topology.script.number.args`, which
+      defaults to 100, answered with `/myrack/myhost` paths), and the fallback: with neither
+      configured, "the rack id '/default-rack' is returned for any passed IP address".
+      [hadoop.apache.org](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-common/RackAwareness.html)
+
+## Related
+
+- [Stream Processing](/notes/system-design/stream-processing) - the real-time counterpart, and where Spark Streaming sits.
+- [Storage and Retrieval](/notes/system-design/storage-and-retrieval) - column-oriented storage, which HBase relies on.
