@@ -29,7 +29,7 @@ export default function RootLayout({
       <body>
         <LiveCursorsProvider>
           <CursorProvider>{children}</CursorProvider>
-          <LiveCursors />
+          {/* <LiveCursors /> */}
         </LiveCursorsProvider>
       </body>
     </html>
