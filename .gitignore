@@ -42,5 +42,5 @@ next-env.d.ts
 
 CV*.pdf
 
-notes/*
+notes
 .claude
